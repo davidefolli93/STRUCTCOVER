@@ -19,8 +19,14 @@ xdg-open demo/report/index.html
 
 ## Requirements
 
-Install dependencies:
+Install runtime dependencies:
 
 ```sh
 pip install -r requirements.txt
+```
+
+Install dev/test dependencies:
+
+```sh
+pip install -r requirements-dev.txt
 ```
