@@ -442,13 +442,16 @@ def rel_href(base_dir: Path, target: Path) -> str:
 
 def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path):
     types = sorted(file_info.types, key=lambda t: (-(t.size or 0), t.display_name))
+    base_dir = Path("file") / rel_path
+    base_dir = base_dir.parent
     rows = []
     for info in types:
         size = "—" if info.size is None else str(info.size)
         hole_count = len([h for h in info.holes if h.kind == "hole"]) if info.kind == "struct" else "—"
+        type_href = rel_href(base_dir, Path("type") / f"{info.type_id}.html")
         rows.append(
             "<tr>"
-            f"<td><a href=\"../type/{info.type_id}.html\">{html.escape(info.display_name)}</a></td>"
+            f"<td><a href=\"{type_href}\">{html.escape(info.display_name)}</a></td>"
             f"<td>{info.kind}</td><td>{size}</td><td>{hole_count}</td>"
             "</tr>"
         )
@@ -459,8 +462,6 @@ def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path):
     )
     out_path = out_dir / "file" / rel_path
     out_path = out_path.with_suffix(out_path.suffix + ".html")
-    base_dir = Path("file") / rel_path
-    base_dir = base_dir.parent
     body = render_breadcrumbs(
         [
             ("Index", rel_href(base_dir, Path("index.html"))),
