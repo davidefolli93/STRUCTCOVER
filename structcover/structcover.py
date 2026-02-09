@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
 from elftools.dwarf.dwarf_expr import DWARFExprParser
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -531,14 +534,22 @@ def render_tree_pages(out_dir: Path, src_root: Path, files: Dict[Path, FileInfo]
         out_path.write_text(html_page(f"Dir {display_name}", body))
 
 
-def build_report(elf_path: Path, out_dir: Path, src_root: Optional[Path]):
+def build_report(
+    elf_path: Path,
+    out_dir: Path,
+    src_root: Optional[Path],
+    log_sample: int,
+    log_paths: bool,
+):
     types, _ = collect_types(elf_path)
+    logger.info("Collected %d types from %s", len(types), elf_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     files: Dict[Path, FileInfo] = {}
     external_types: List[TypeInfo] = []
     if src_root:
         src_root = src_root.resolve()
+        logger.info("Resolved src-root to %s", src_root)
     for info in types:
         if info.decl_file and src_root:
             try:
@@ -552,6 +563,22 @@ def build_report(elf_path: Path, out_dir: Path, src_root: Optional[Path]):
         else:
             external_types.append(info)
 
+    logger.info("Mapped %d source files", len(files))
+    logger.info("Classified %d external types", len(external_types))
+    if src_root and not files:
+        logger.warning("No source files mapped under src-root; source tree will be empty.")
+    if log_paths:
+        for rel, info in files.items():
+            logger.debug("Source file: %s (%d types)", rel, len(info.types))
+        for idx, info in enumerate(external_types[:log_sample]):
+            logger.debug(
+                "External type sample [%d/%d]: %s (%s)",
+                idx + 1,
+                len(external_types),
+                info.display_name,
+                info.decl_file if info.decl_file else "no decl file",
+            )
+
     for info in types:
         render_type_page(out_dir, info)
 
@@ -559,9 +586,11 @@ def build_report(elf_path: Path, out_dir: Path, src_root: Optional[Path]):
         for rel_path, info in files.items():
             render_file_page(out_dir, info, rel_path)
         render_tree_pages(out_dir, src_root, files)
+        logger.info("Rendered %d file pages and source tree", len(files))
 
     render_external(out_dir, external_types)
     render_index(out_dir, has_tree=bool(src_root))
+    logger.info("Rendered external index and report index")
 
 
 def parse_args() -> argparse.Namespace:
@@ -569,6 +598,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("elf", type=Path, help="Path to ELF file")
     parser.add_argument("--out", required=True, type=Path, help="Output directory")
     parser.add_argument("--src-root", type=Path, help="Source root directory")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
+    )
+    parser.add_argument("--log-file", type=Path, help="Write logs to this file instead of stderr")
+    parser.add_argument(
+        "--log-sample",
+        type=int,
+        default=5,
+        help="How many external type samples to log (default: 5)",
+    )
+    parser.add_argument(
+        "--log-paths",
+        action="store_true",
+        help="Log mapped source file paths and external type samples",
+    )
     return parser.parse_args()
 
 
@@ -576,7 +623,12 @@ def main() -> int:
     args = parse_args()
     if not args.elf.exists():
         raise SystemExit(f"ELF not found: {args.elf}")
-    build_report(args.elf, args.out, args.src_root)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        filename=str(args.log_file) if args.log_file else None,
+        format="%(levelname)s %(message)s",
+    )
+    build_report(args.elf, args.out, args.src_root, args.log_sample, args.log_paths)
     return 0
 
 
