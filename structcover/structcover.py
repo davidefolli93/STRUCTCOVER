@@ -6,6 +6,7 @@ import hashlib
 import html
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -15,6 +16,21 @@ from elftools.dwarf.descriptions import describe_form_class
 from elftools.dwarf.dwarf_expr import DWARFExprParser
 
 logger = logging.getLogger(__name__)
+WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
+
+
+def normalize_decl_path(path: Path) -> Path:
+    raw = str(path)
+    matches = list(WINDOWS_DRIVE_RE.finditer(raw))
+    if not matches:
+        return path
+    match = matches[-1]
+    win_path = raw[match.start() :].replace("\\", "/")
+    drive = win_path[0].lower()
+    remainder = win_path[2:]
+    if remainder.startswith("/"):
+        remainder = remainder[1:]
+    return Path("/mnt") / drive / remainder
 
 
 @dataclass
@@ -552,12 +568,15 @@ def build_report(
         logger.info("Resolved src-root to %s", src_root)
     for info in types:
         if info.decl_file and src_root:
+            normalized_decl = normalize_decl_path(info.decl_file)
+            if normalized_decl != info.decl_file:
+                logger.debug("Normalized decl path %s -> %s", info.decl_file, normalized_decl)
             try:
-                rel = info.decl_file.resolve().relative_to(src_root)
+                rel = normalized_decl.resolve().relative_to(src_root)
             except ValueError:
                 external_types.append(info)
                 continue
-            files.setdefault(rel, FileInfo(path=info.decl_file, types=[])).types.append(info)
+            files.setdefault(rel, FileInfo(path=normalized_decl, types=[])).types.append(info)
         elif src_root:
             external_types.append(info)
         else:
