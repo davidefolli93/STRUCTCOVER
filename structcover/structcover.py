@@ -82,6 +82,7 @@ def apply_src_root_suffix(path: Path, src_root: Path) -> Optional[Path]:
 class MemberInfo:
     name: str
     type_name: str
+    type_id: Optional[str]
     offset: Optional[int]
     size: Optional[int]
 
@@ -289,6 +290,7 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
 
         resolver = TypeResolver(dwarfinfo, preferred_names)
         types: List[TypeInfo] = []
+        type_ids: Dict[int, str] = {}
 
         for cu in dwarfinfo.iter_CUs():
             lineprog = dwarfinfo.line_program_for_CU(cu)
@@ -306,6 +308,7 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                     decl_line = die.attributes["DW_AT_decl_line"].value
                 kind = "typedef" if die.tag == "DW_TAG_typedef" else "struct" if die.tag == "DW_TAG_structure_type" else "union"
                 type_id = type_id_for(cu.cu_offset, die.offset)
+                type_ids[die.offset] = type_id
                 info = TypeInfo(
                     type_id=type_id,
                     kind=kind,
@@ -324,10 +327,14 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                         member_type_name = resolver.resolve_type_name(member_type_die)
                         member_size = resolver.resolve_type_size(member_type_die, cu)
                         offset = parse_member_offset(child.attributes.get("DW_AT_data_member_location"), cu)
+                        member_type_id = None
+                        if member_type_die is not None:
+                            member_type_id = type_ids.get(member_type_die.offset)
                         info.members.append(
                             MemberInfo(
                                 name=member_name,
                                 type_name=member_type_name,
+                                type_id=member_type_id,
                                 offset=offset,
                                 size=member_size,
                             )
@@ -481,6 +488,7 @@ def render_type_page(out_dir: Path, info: TypeInfo):
         decl = html.escape(str(info.decl_file))
         if info.decl_line:
             decl += f":{info.decl_line}"
+    base_dir = Path("type")
     body = render_breadcrumbs([("Index", "../index.html"), ("Type", f"../type/{info.type_id}.html")])
     body += f"<h1>{html.escape(info.display_name)}</h1>"
     body += (
@@ -494,9 +502,13 @@ def render_type_page(out_dir: Path, info: TypeInfo):
         for member in info.members:
             offset = "—" if member.offset is None else str(member.offset)
             msize = "—" if member.size is None else str(member.size)
+            if member.type_id:
+                type_cell = f"<a href=\"{rel_href(base_dir, Path('type') / f'{member.type_id}.html')}\">{html.escape(member.type_name)}</a>"
+            else:
+                type_cell = html.escape(member.type_name)
             rows.append(
                 "<tr>"
-                f"<td>{html.escape(member.name)}</td><td>{html.escape(member.type_name)}</td>"
+                f"<td>{html.escape(member.name)}</td><td>{type_cell}</td>"
                 f"<td>{offset}</td><td>{msize}</td>"
                 "</tr>"
             )
