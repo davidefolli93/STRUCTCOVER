@@ -7,8 +7,9 @@ import html
 import logging
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from elftools.elf.elffile import ELFFile
@@ -48,6 +49,21 @@ def apply_root_aliases(path: Path, aliases: List[Tuple[Path, Path]]) -> Path:
         logger.debug("Applied src-root alias %s -> %s: %s", src_root, dest_root, mapped)
         return mapped
     return path
+
+
+def decl_root_key(path: Path) -> str:
+    raw = str(path)
+    if WINDOWS_DRIVE_RE.search(raw):
+        win = PureWindowsPath(raw)
+        parts = win.parts
+        if len(parts) >= 2:
+            return f"{win.drive}\\{parts[1]}"
+        return win.drive or raw
+    posix = PurePosixPath(raw)
+    parts = posix.parts
+    if len(parts) >= 2:
+        return f"/{parts[1]}"
+    return raw
 
 
 @dataclass
@@ -584,8 +600,11 @@ def build_report(
     if src_root:
         src_root = src_root.resolve()
         logger.info("Resolved src-root to %s", src_root)
+    decl_samples: List[Path] = []
     for info in types:
         if info.decl_file and src_root:
+            if log_paths and len(decl_samples) < log_sample:
+                decl_samples.append(info.decl_file)
             normalized_decl = normalize_decl_path(info.decl_file)
             if normalized_decl != info.decl_file:
                 logger.debug("Normalized decl path %s -> %s", info.decl_file, normalized_decl)
@@ -611,6 +630,16 @@ def build_report(
     logger.info("Classified %d external types", len(external_types))
     if src_root and not files:
         logger.warning("No source files mapped under src-root; source tree will be empty.")
+        if log_paths:
+            roots = Counter(
+                decl_root_key(info.decl_file)
+                for info in types
+                if info.decl_file is not None
+            )
+            for root, count in roots.most_common(log_sample):
+                logger.debug("Top decl root: %s (%d types)", root, count)
+            for sample in decl_samples:
+                logger.debug("Decl path sample: %s", sample)
     if log_paths:
         for rel, info in files.items():
             logger.debug("Source file: %s (%d types)", rel, len(info.types))
