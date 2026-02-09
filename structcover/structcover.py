@@ -436,6 +436,10 @@ def render_external(out_dir: Path, external_types: List[TypeInfo]):
     out_path.write_text(html_page("External types", body))
 
 
+def rel_href(base_dir: Path, target: Path) -> str:
+    return os.path.relpath(target, start=base_dir).replace("\\", "/")
+
+
 def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path):
     types = sorted(file_info.types, key=lambda t: (-(t.size or 0), t.display_name))
     rows = []
@@ -453,16 +457,18 @@ def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path):
         + "\n".join(rows)
         + "</tbody></table>"
     )
+    out_path = out_dir / "file" / rel_path
+    out_path = out_path.with_suffix(out_path.suffix + ".html")
+    base_dir = Path("file") / rel_path
+    base_dir = base_dir.parent
     body = render_breadcrumbs(
         [
-            ("Index", "../index.html"),
-            ("Source tree", "../dir/index.html"),
-            (str(rel_path), f"../file/{rel_path.as_posix()}.html"),
+            ("Index", rel_href(base_dir, Path("index.html"))),
+            ("Source tree", rel_href(base_dir, Path("dir") / "index.html")),
+            (str(rel_path), rel_href(base_dir, Path("file") / rel_path.with_suffix(rel_path.suffix + ".html"))),
         ]
     )
     body += f"<h1>{html.escape(str(rel_path))}</h1>" + table
-    out_path = out_dir / "file" / rel_path
-    out_path = out_path.with_suffix(out_path.suffix + ".html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_page(f"File {rel_path}", body))
 
@@ -563,31 +569,35 @@ def render_tree_pages(out_dir: Path, src_root: Path, files: Dict[Path, FileInfo]
         dir_sizes[dir_path] = max_size
 
     for dir_path, content in tree.items():
+        base_dir = Path("dir") / dir_path
         items = []
         for child_dir in sorted(content["dirs"], key=lambda p: str(p)):
             size = dir_sizes.get(child_dir)
             size_label = "—" if size is None else str(size)
-            items.append(
-                f"<tr><td><a href=\"../dir/{child_dir.as_posix()}/index.html\">{child_dir.name}/</a></td><td>{size_label}</td></tr>"
-            )
+            href = rel_href(base_dir, Path("dir") / child_dir / "index.html")
+            items.append(f"<tr><td><a href=\"{href}\">{child_dir.name}/</a></td><td>{size_label}</td></tr>")
         for file_rel in sorted(content["files"], key=lambda p: str(p)):
             size = max_struct_size(files[file_rel].types)
             size_label = "—" if size is None else str(size)
-            items.append(
-                f"<tr><td><a href=\"../file/{file_rel.as_posix()}.html\">{file_rel.name}</a></td><td>{size_label}</td></tr>"
-            )
+            file_target = Path("file") / file_rel
+            file_target = file_target.with_suffix(file_target.suffix + ".html")
+            href = rel_href(base_dir, file_target)
+            items.append(f"<tr><td><a href=\"{href}\">{file_rel.name}</a></td><td>{size_label}</td></tr>")
         table = (
             "<table><thead><tr><th>Name</th><th>Max struct size</th></tr></thead><tbody>"
             + "\n".join(items)
             + "</tbody></table>"
         )
-        breadcrumbs = [("Index", "../index.html"), ("Source tree", "../dir/index.html")]
+        breadcrumbs = [
+            ("Index", rel_href(base_dir, Path("index.html"))),
+            ("Source tree", rel_href(base_dir, Path("dir") / "index.html")),
+        ]
         if dir_path != Path("."):
             parts = dir_path.parts
             path_accum = Path(".")
             for part in parts:
                 path_accum = path_accum / part
-                breadcrumbs.append((part, f"../dir/{path_accum.as_posix()}/index.html"))
+                breadcrumbs.append((part, rel_href(base_dir, Path("dir") / path_accum / "index.html")))
         body = render_breadcrumbs(breadcrumbs)
         display_name = "/" if dir_path == Path(".") else dir_path.as_posix()
         body += f"<h1>{html.escape(display_name)}</h1>" + table
