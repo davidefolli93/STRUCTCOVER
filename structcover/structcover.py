@@ -504,7 +504,34 @@ def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path, hidden_
     out_path.write_text(html_page(f"File {rel_path}", body))
 
 
-def render_type_page(out_dir: Path, info: TypeInfo):
+def build_usage_map(
+    types: List[TypeInfo], hidden_typedef_ids: Set[str]
+) -> Dict[str, List[Tuple[str, str]]]:
+    usage_map: Dict[str, List[Tuple[str, str]]] = {}
+    id_to_info = {info.type_id: info for info in types}
+    visible_typedefs = {
+        info.type_id
+        for info in types
+        if info.kind == "typedef" and info.type_id not in hidden_typedef_ids
+    }
+    for info in types:
+        if info.kind in {"struct", "union"}:
+            for member in info.members:
+                if not member.type_id:
+                    continue
+                usage_map.setdefault(member.type_id, []).append(
+                    (info.type_id, f"{info.display_name}::{member.name}")
+                )
+        if info.kind == "typedef" and info.underlying_id and info.type_id in visible_typedefs:
+            usage_map.setdefault(info.underlying_id, []).append(
+                (info.type_id, f"{info.display_name} (typedef)")
+            )
+    for entries in usage_map.values():
+        entries.sort(key=lambda item: item[1])
+    return usage_map
+
+
+def render_type_page(out_dir: Path, info: TypeInfo, usage_map: Dict[str, List[Tuple[str, str]]]):
     size = "—" if info.size is None else str(info.size)
     decl = "—"
     if info.decl_file:
@@ -555,6 +582,18 @@ def render_type_page(out_dir: Path, info: TypeInfo):
         body += (
             "<h2>Holes & padding</h2>"
             "<table><thead><tr><th>Offset</th><th>Size</th><th>Kind</th></tr></thead><tbody>"
+            + "\n".join(rows)
+            + "</tbody></table>"
+        )
+    used_by = usage_map.get(info.type_id, [])
+    if used_by:
+        rows = []
+        for type_id, label in used_by:
+            href = rel_href(base_dir, Path("type") / f"{type_id}.html")
+            rows.append(f"<tr><td><a href=\"{href}\">{html.escape(label)}</a></td></tr>")
+        body += (
+            "<h2>Used by</h2>"
+            "<table><thead><tr><th>Type</th></tr></thead><tbody>"
             + "\n".join(rows)
             + "</tbody></table>"
         )
@@ -723,10 +762,11 @@ def build_report(
                 info.decl_file if info.decl_file else "no decl file",
             )
 
+    usage_map = build_usage_map(types, hidden_typedef_ids)
     for info in types:
         if info.kind == "typedef" and info.type_id in hidden_typedef_ids:
             continue
-        render_type_page(out_dir, info)
+        render_type_page(out_dir, info, usage_map)
 
     if src_root:
         for rel_path, info in files.items():
