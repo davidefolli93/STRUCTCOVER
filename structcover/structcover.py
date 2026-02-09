@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
-from elftools.dwarf.expr import DWARFExprParser
+from elftools.dwarf.dwarf_expr import DWARFExprParser
 
 
 @dataclass
