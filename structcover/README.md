@@ -22,6 +22,17 @@ python3 structcover/structcover.py demo/build/demo.elf \
   --log-sample 20
 ```
 
+If DWARF paths use a different root (e.g. WSL vs Windows), add aliases:
+
+```sh
+python3 structcover/structcover.py demo/build/demo.elf \
+  --src-root /mnt/c/Users/me/project \
+  --src-root-alias "C:\\Users\\me\\project=/mnt/c/Users/me/project" \
+  --out demo/report \
+  --log-level DEBUG \
+  --log-paths
+```
+
 Open the report in a browser:
 
 ```sh

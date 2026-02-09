@@ -33,6 +33,18 @@ def normalize_decl_path(path: Path) -> Path:
     return Path("/mnt") / drive / remainder
 
 
+def apply_root_aliases(path: Path, aliases: List[Tuple[Path, Path]]) -> Path:
+    for src_root, dest_root in aliases:
+        try:
+            relative = path.resolve().relative_to(src_root.resolve())
+        except ValueError:
+            continue
+        mapped = dest_root / relative
+        logger.debug("Applied src-root alias %s -> %s: %s", src_root, dest_root, mapped)
+        return mapped
+    return path
+
+
 @dataclass
 class MemberInfo:
     name: str
@@ -556,6 +568,7 @@ def build_report(
     src_root: Optional[Path],
     log_sample: int,
     log_paths: bool,
+    src_root_aliases: List[Tuple[Path, Path]],
 ):
     types, _ = collect_types(elf_path)
     logger.info("Collected %d types from %s", len(types), elf_path)
@@ -571,9 +584,16 @@ def build_report(
             normalized_decl = normalize_decl_path(info.decl_file)
             if normalized_decl != info.decl_file:
                 logger.debug("Normalized decl path %s -> %s", info.decl_file, normalized_decl)
+            normalized_decl = apply_root_aliases(normalized_decl, src_root_aliases)
             try:
                 rel = normalized_decl.resolve().relative_to(src_root)
             except ValueError:
+                if log_paths and len(external_types) < log_sample:
+                    logger.debug(
+                        "Decl path not under src-root: %s (src-root: %s)",
+                        normalized_decl,
+                        src_root,
+                    )
                 external_types.append(info)
                 continue
             files.setdefault(rel, FileInfo(path=normalized_decl, types=[])).types.append(info)
@@ -635,6 +655,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log mapped source file paths and external type samples",
     )
+    parser.add_argument(
+        "--src-root-alias",
+        action="append",
+        default=[],
+        metavar="FROM=TO",
+        help="Map source roots when DWARF paths use a different base (repeatable).",
+    )
     return parser.parse_args()
 
 
@@ -642,12 +669,18 @@ def main() -> int:
     args = parse_args()
     if not args.elf.exists():
         raise SystemExit(f"ELF not found: {args.elf}")
+    aliases: List[Tuple[Path, Path]] = []
+    for raw in args.src_root_alias:
+        if "=" not in raw:
+            raise SystemExit(f"Invalid --src-root-alias (expected FROM=TO): {raw}")
+        src_raw, dest_raw = raw.split("=", 1)
+        aliases.append((Path(src_raw), Path(dest_raw)))
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         filename=str(args.log_file) if args.log_file else None,
         format="%(levelname)s %(message)s",
     )
-    build_report(args.elf, args.out, args.src_root, args.log_sample, args.log_paths)
+    build_report(args.elf, args.out, args.src_root, args.log_sample, args.log_paths, aliases)
     return 0
 
 
