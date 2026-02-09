@@ -357,7 +357,8 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str], Set[s
                     base_die = die.get_DIE_from_attribute("DW_AT_type")
                     info.underlying = resolver.resolve_type_name(base_die)
                     if base_die is not None and base_die.offset in type_ids:
-                        info.underlying_id = type_ids[base_die.offset]
+                        target_offset = typedef_alias_target.get(base_die.offset, base_die.offset)
+                        info.underlying_id = type_ids.get(target_offset)
                 types.append(info)
     hidden_typedef_ids = {
         type_ids[offset] for offset in typedef_alias_target.keys() if offset in type_ids
