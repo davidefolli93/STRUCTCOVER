@@ -520,14 +520,15 @@ def render_type_page(out_dir: Path, info: TypeInfo):
 def build_tree(src_root: Path, files: Dict[Path, FileInfo]) -> Dict[Path, Dict[str, List[Path]]]:
     tree: Dict[Path, Dict[str, List[Path]]] = {}
     for rel_path in files:
-        current = Path(".")
         parts = rel_path.parts
-        for idx, part in enumerate(parts[:-1]):
-            current = current / part
-            tree.setdefault(current, {"dirs": [], "files": []})
-            next_dir = current / parts[idx + 1] if idx + 1 < len(parts) else None
-            if next_dir and next_dir not in tree[current]["dirs"]:
+        current = Path(".")
+        tree.setdefault(current, {"dirs": [], "files": []})
+        for part in parts[:-1]:
+            next_dir = current / part
+            if next_dir not in tree[current]["dirs"]:
                 tree[current]["dirs"].append(next_dir)
+            current = next_dir
+            tree.setdefault(current, {"dirs": [], "files": []})
         tree.setdefault(Path("."), {"dirs": [], "files": []})
         if rel_path.parent == Path("."):
             parent = Path(".")
