@@ -20,6 +20,8 @@ WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
 
 
 def normalize_decl_path(path: Path) -> Path:
+    if os.name == "nt":
+        return path
     raw = str(path)
     matches = list(WINDOWS_DRIVE_RE.finditer(raw))
     if not matches:
