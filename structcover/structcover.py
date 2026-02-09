@@ -10,7 +10,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
@@ -268,7 +268,7 @@ def resolve_decl_path(cu, lineprog, file_index: int) -> Optional[Path]:
     return path
 
 
-def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
+def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str], Set[str]]:
     with elf_path.open("rb") as handle:
         elf = ELFFile(handle)
         if not elf.has_dwarf_info():
@@ -291,6 +291,20 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
         resolver = TypeResolver(dwarfinfo, preferred_names)
         types: List[TypeInfo] = []
         type_ids: Dict[int, str] = {}
+        typedef_alias_target: Dict[int, int] = {}
+
+        for cu in dwarfinfo.iter_CUs():
+            for die in cu.iter_DIEs():
+                if die.tag not in {"DW_TAG_structure_type", "DW_TAG_union_type", "DW_TAG_typedef"}:
+                    continue
+                type_ids[die.offset] = type_id_for(cu.cu_offset, die.offset)
+                if die.tag == "DW_TAG_typedef" and "DW_AT_type" in die.attributes:
+                    target = die.get_DIE_from_attribute("DW_AT_type")
+                    if target and target.tag in {"DW_TAG_structure_type", "DW_TAG_union_type"}:
+                        typedef_name = resolver._get_attr_str(die, "DW_AT_name") or ""
+                        target_name = resolver.resolve_type_name(target)
+                        if typedef_name and typedef_name == target_name:
+                            typedef_alias_target[die.offset] = target.offset
 
         for cu in dwarfinfo.iter_CUs():
             lineprog = dwarfinfo.line_program_for_CU(cu)
@@ -307,8 +321,7 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                 if "DW_AT_decl_line" in die.attributes:
                     decl_line = die.attributes["DW_AT_decl_line"].value
                 kind = "typedef" if die.tag == "DW_TAG_typedef" else "struct" if die.tag == "DW_TAG_structure_type" else "union"
-                type_id = type_id_for(cu.cu_offset, die.offset)
-                type_ids[die.offset] = type_id
+                type_id = type_ids[die.offset]
                 info = TypeInfo(
                     type_id=type_id,
                     kind=kind,
@@ -329,7 +342,8 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                         offset = parse_member_offset(child.attributes.get("DW_AT_data_member_location"), cu)
                         member_type_id = None
                         if member_type_die is not None:
-                            member_type_id = type_ids.get(member_type_die.offset)
+                            target_offset = typedef_alias_target.get(member_type_die.offset, member_type_die.offset)
+                            member_type_id = type_ids.get(target_offset)
                         info.members.append(
                             MemberInfo(
                                 name=member_name,
@@ -345,7 +359,10 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                     base_die = die.get_DIE_from_attribute("DW_AT_type")
                     info.underlying = resolver.resolve_type_name(base_die)
                 types.append(info)
-    return types, preferred_names
+    hidden_typedef_ids = {
+        type_ids[offset] for offset in typedef_alias_target.keys() if offset in type_ids
+    }
+    return types, preferred_names, hidden_typedef_ids
 
 
 def compute_holes(struct_size: Optional[int], members: Iterable[MemberInfo]) -> List[HoleInfo]:
@@ -447,8 +464,13 @@ def rel_href(base_dir: Path, target: Path) -> str:
     return os.path.relpath(target, start=base_dir).replace("\\", "/")
 
 
-def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path):
-    types = sorted(file_info.types, key=lambda t: (-(t.size or 0), t.display_name))
+def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path, hidden_typedef_ids: Set[str]):
+    filtered = [
+        info
+        for info in file_info.types
+        if not (info.kind == "typedef" and info.type_id in hidden_typedef_ids)
+    ]
+    types = sorted(filtered, key=lambda t: (-(t.size or 0), t.display_name))
     base_dir = Path("file") / rel_path
     base_dir = base_dir.parent
     rows = []
@@ -628,7 +650,7 @@ def build_report(
     src_root_aliases: List[Tuple[Path, Path]],
     use_suffix_match: bool,
 ):
-    types, _ = collect_types(elf_path)
+    types, _, hidden_typedef_ids = collect_types(elf_path)
     logger.info("Collected %d types from %s", len(types), elf_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -697,14 +719,21 @@ def build_report(
             )
 
     for info in types:
+        if info.kind == "typedef" and info.type_id in hidden_typedef_ids:
+            continue
         render_type_page(out_dir, info)
 
     if src_root:
         for rel_path, info in files.items():
-            render_file_page(out_dir, info, rel_path)
+            render_file_page(out_dir, info, rel_path, hidden_typedef_ids)
         render_tree_pages(out_dir, src_root, files)
         logger.info("Rendered %d file pages and source tree", len(files))
 
+    external_types = [
+        info
+        for info in external_types
+        if not (info.kind == "typedef" and info.type_id in hidden_typedef_ids)
+    ]
     render_external(out_dir, external_types)
     render_index(out_dir, has_tree=bool(src_root))
     logger.info("Rendered external index and report index")
