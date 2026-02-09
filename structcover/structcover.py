@@ -106,6 +106,7 @@ class TypeInfo:
     members: List[MemberInfo] = field(default_factory=list)
     holes: List[HoleInfo] = field(default_factory=list)
     underlying: Optional[str] = None
+    underlying_id: Optional[str] = None
 
 
 @dataclass
@@ -301,10 +302,7 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str], Set[s
                 if die.tag == "DW_TAG_typedef" and "DW_AT_type" in die.attributes:
                     target = die.get_DIE_from_attribute("DW_AT_type")
                     if target and target.tag in {"DW_TAG_structure_type", "DW_TAG_union_type"}:
-                        typedef_name = resolver._get_attr_str(die, "DW_AT_name") or ""
-                        target_name = resolver.resolve_type_name(target)
-                        if typedef_name and typedef_name == target_name:
-                            typedef_alias_target[die.offset] = target.offset
+                        typedef_alias_target[die.offset] = target.offset
 
         for cu in dwarfinfo.iter_CUs():
             lineprog = dwarfinfo.line_program_for_CU(cu)
@@ -358,6 +356,8 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str], Set[s
                 elif die.tag == "DW_TAG_typedef":
                     base_die = die.get_DIE_from_attribute("DW_AT_type")
                     info.underlying = resolver.resolve_type_name(base_die)
+                    if base_die is not None and base_die.offset in type_ids:
+                        info.underlying_id = type_ids[base_die.offset]
                 types.append(info)
     hidden_typedef_ids = {
         type_ids[offset] for offset in typedef_alias_target.keys() if offset in type_ids
@@ -518,7 +518,11 @@ def render_type_page(out_dir: Path, info: TypeInfo):
         f"Declared at: {decl}</p>"
     )
     if info.kind == "typedef" and info.underlying:
-        body += f"<p>Underlying type: {html.escape(info.underlying)}</p>"
+        if info.underlying_id:
+            underlying_href = rel_href(base_dir, Path("type") / f"{info.underlying_id}.html")
+            body += f"<p>Underlying type: <a href=\"{underlying_href}\">{html.escape(info.underlying)}</a></p>"
+        else:
+            body += f"<p>Underlying type: {html.escape(info.underlying)}</p>"
     if info.members:
         rows = []
         for member in info.members:
