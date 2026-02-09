@@ -475,6 +475,8 @@ def build_tree(src_root: Path, files: Dict[Path, FileInfo]) -> Dict[Path, Dict[s
         for i in range(1, len(parts)):
             dir_path = Path(*parts[:i])
             tree.setdefault(dir_path, {"dirs": [], "files": []})
+    if not tree:
+        tree[Path(".")] = {"dirs": [], "files": []}
     return tree
 
 
