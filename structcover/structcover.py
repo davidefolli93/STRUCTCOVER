@@ -20,12 +20,15 @@ WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
 
 
 def normalize_decl_path(path: Path) -> Path:
-    if os.name == "nt":
-        return path
     raw = str(path)
     matches = list(WINDOWS_DRIVE_RE.finditer(raw))
     if not matches:
         return path
+    if os.name == "nt":
+        match = matches[-1]
+        if match.start() == 0:
+            return path
+        return Path(raw[match.start() :])
     match = matches[-1]
     win_path = raw[match.start() :].replace("\\", "/")
     drive = win_path[0].lower()
