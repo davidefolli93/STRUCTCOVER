@@ -11,6 +11,17 @@ make -C demo
 python3 structcover/structcover.py demo/build/demo.elf --src-root demo/src --out demo/report
 ```
 
+Enable debugging logs for source mapping issues:
+
+```sh
+python3 structcover/structcover.py demo/build/demo.elf \
+  --src-root demo/src \
+  --out demo/report \
+  --log-level DEBUG \
+  --log-paths \
+  --log-sample 20
+```
+
 Open the report in a browser:
 
 ```sh
