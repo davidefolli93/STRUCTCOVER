@@ -66,6 +66,18 @@ def decl_root_key(path: Path) -> str:
     return raw
 
 
+def apply_src_root_suffix(path: Path, src_root: Path) -> Optional[Path]:
+    path_parts = Path(path).parts
+    root_parts = Path(src_root).parts
+    if not root_parts:
+        return None
+    for idx in range(0, len(path_parts) - len(root_parts) + 1):
+        if path_parts[idx : idx + len(root_parts)] == root_parts:
+            suffix = path_parts[idx + len(root_parts) :]
+            return Path(src_root, *suffix)
+    return None
+
+
 @dataclass
 class MemberInfo:
     name: str
@@ -590,6 +602,7 @@ def build_report(
     log_sample: int,
     log_paths: bool,
     src_root_aliases: List[Tuple[Path, Path]],
+    use_suffix_match: bool,
 ):
     types, _ = collect_types(elf_path)
     logger.info("Collected %d types from %s", len(types), elf_path)
@@ -609,6 +622,13 @@ def build_report(
             if normalized_decl != info.decl_file:
                 logger.debug("Normalized decl path %s -> %s", info.decl_file, normalized_decl)
             normalized_decl = apply_root_aliases(normalized_decl, src_root_aliases)
+            if use_suffix_match and src_root:
+                suffix_mapped = apply_src_root_suffix(normalized_decl, src_root)
+                if suffix_mapped and suffix_mapped != normalized_decl:
+                    logger.debug(
+                        "Applied src-root suffix match %s -> %s", normalized_decl, suffix_mapped
+                    )
+                    normalized_decl = suffix_mapped
             try:
                 rel = normalized_decl.resolve().relative_to(src_root)
             except ValueError:
@@ -696,6 +716,11 @@ def parse_args() -> argparse.Namespace:
         metavar="FROM=TO",
         help="Map source roots when DWARF paths use a different base (repeatable).",
     )
+    parser.add_argument(
+        "--src-root-suffix",
+        action="store_true",
+        help="Allow suffix-based matching when DWARF paths include extra prefixes.",
+    )
     return parser.parse_args()
 
 
@@ -714,7 +739,15 @@ def main() -> int:
         filename=str(args.log_file) if args.log_file else None,
         format="%(levelname)s %(message)s",
     )
-    build_report(args.elf, args.out, args.src_root, args.log_sample, args.log_paths, aliases)
+    build_report(
+        args.elf,
+        args.out,
+        args.src_root,
+        args.log_sample,
+        args.log_paths,
+        aliases,
+        args.src_root_suffix,
+    )
     return 0
 
 

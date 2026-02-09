@@ -33,6 +33,17 @@ python3 structcover/structcover.py demo/build/demo.elf \
   --log-paths
 ```
 
+If DWARF paths embed extra prefixes, enable suffix matching:
+
+```sh
+python3 structcover/structcover.py demo/build/demo.elf \
+  --src-root demo/src \
+  --src-root-suffix \
+  --out demo/report \
+  --log-level DEBUG \
+  --log-paths
+```
+
 Open the report in a browser:
 
 ```sh
