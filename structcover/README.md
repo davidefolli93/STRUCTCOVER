@@ -11,6 +11,39 @@ make -C demo
 python3 structcover/structcover.py demo/build/demo.elf --src-root demo/src --out demo/report
 ```
 
+Enable debugging logs for source mapping issues:
+
+```sh
+python3 structcover/structcover.py demo/build/demo.elf \
+  --src-root demo/src \
+  --out demo/report \
+  --log-level DEBUG \
+  --log-paths \
+  --log-sample 20
+```
+
+If DWARF paths use a different root (e.g. WSL vs Windows), add aliases:
+
+```sh
+python3 structcover/structcover.py demo/build/demo.elf \
+  --src-root /mnt/c/Users/me/project \
+  --src-root-alias "C:\\Users\\me\\project=/mnt/c/Users/me/project" \
+  --out demo/report \
+  --log-level DEBUG \
+  --log-paths
+```
+
+If DWARF paths embed extra prefixes, enable suffix matching:
+
+```sh
+python3 structcover/structcover.py demo/build/demo.elf \
+  --src-root demo/src \
+  --src-root-suffix \
+  --out demo/report \
+  --log-level DEBUG \
+  --log-paths
+```
+
 Open the report in a browser:
 
 ```sh

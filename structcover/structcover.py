@@ -4,20 +4,85 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import logging
 import os
+import re
+from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
-from elftools.dwarf.expr import DWARFExprParser
+from elftools.dwarf.dwarf_expr import DWARFExprParser
+
+logger = logging.getLogger(__name__)
+WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
+
+
+def normalize_decl_path(path: Path) -> Path:
+    raw = str(path)
+    matches = list(WINDOWS_DRIVE_RE.finditer(raw))
+    if not matches:
+        return path
+    if os.name == "nt":
+        match = matches[-1]
+        if match.start() == 0:
+            return path
+        return Path(raw[match.start() :])
+    match = matches[-1]
+    win_path = raw[match.start() :].replace("\\", "/")
+    drive = win_path[0].lower()
+    remainder = win_path[2:]
+    if remainder.startswith("/"):
+        remainder = remainder[1:]
+    return Path("/mnt") / drive / remainder
+
+
+def apply_root_aliases(path: Path, aliases: List[Tuple[Path, Path]]) -> Path:
+    for src_root, dest_root in aliases:
+        try:
+            relative = path.resolve().relative_to(src_root.resolve())
+        except ValueError:
+            continue
+        mapped = dest_root / relative
+        logger.debug("Applied src-root alias %s -> %s: %s", src_root, dest_root, mapped)
+        return mapped
+    return path
+
+
+def decl_root_key(path: Path) -> str:
+    raw = str(path)
+    if WINDOWS_DRIVE_RE.search(raw):
+        win = PureWindowsPath(raw)
+        parts = win.parts
+        if len(parts) >= 2:
+            return f"{win.drive}\\{parts[1]}"
+        return win.drive or raw
+    posix = PurePosixPath(raw)
+    parts = posix.parts
+    if len(parts) >= 2:
+        return f"/{parts[1]}"
+    return raw
+
+
+def apply_src_root_suffix(path: Path, src_root: Path) -> Optional[Path]:
+    path_parts = Path(path).parts
+    root_parts = Path(src_root).parts
+    if not root_parts:
+        return None
+    for idx in range(0, len(path_parts) - len(root_parts) + 1):
+        if path_parts[idx : idx + len(root_parts)] == root_parts:
+            suffix = path_parts[idx + len(root_parts) :]
+            return Path(src_root, *suffix)
+    return None
 
 
 @dataclass
 class MemberInfo:
     name: str
     type_name: str
+    type_id: Optional[str]
     offset: Optional[int]
     size: Optional[int]
 
@@ -41,6 +106,7 @@ class TypeInfo:
     members: List[MemberInfo] = field(default_factory=list)
     holes: List[HoleInfo] = field(default_factory=list)
     underlying: Optional[str] = None
+    underlying_id: Optional[str] = None
 
 
 @dataclass
@@ -203,7 +269,7 @@ def resolve_decl_path(cu, lineprog, file_index: int) -> Optional[Path]:
     return path
 
 
-def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
+def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str], Set[str]]:
     with elf_path.open("rb") as handle:
         elf = ELFFile(handle)
         if not elf.has_dwarf_info():
@@ -225,6 +291,18 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
 
         resolver = TypeResolver(dwarfinfo, preferred_names)
         types: List[TypeInfo] = []
+        type_ids: Dict[int, str] = {}
+        typedef_alias_target: Dict[int, int] = {}
+
+        for cu in dwarfinfo.iter_CUs():
+            for die in cu.iter_DIEs():
+                if die.tag not in {"DW_TAG_structure_type", "DW_TAG_union_type", "DW_TAG_typedef"}:
+                    continue
+                type_ids[die.offset] = type_id_for(cu.cu_offset, die.offset)
+                if die.tag == "DW_TAG_typedef" and "DW_AT_type" in die.attributes:
+                    target = die.get_DIE_from_attribute("DW_AT_type")
+                    if target and target.tag in {"DW_TAG_structure_type", "DW_TAG_union_type"}:
+                        typedef_alias_target[die.offset] = target.offset
 
         for cu in dwarfinfo.iter_CUs():
             lineprog = dwarfinfo.line_program_for_CU(cu)
@@ -241,7 +319,7 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                 if "DW_AT_decl_line" in die.attributes:
                     decl_line = die.attributes["DW_AT_decl_line"].value
                 kind = "typedef" if die.tag == "DW_TAG_typedef" else "struct" if die.tag == "DW_TAG_structure_type" else "union"
-                type_id = type_id_for(cu.cu_offset, die.offset)
+                type_id = type_ids[die.offset]
                 info = TypeInfo(
                     type_id=type_id,
                     kind=kind,
@@ -260,10 +338,15 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                         member_type_name = resolver.resolve_type_name(member_type_die)
                         member_size = resolver.resolve_type_size(member_type_die, cu)
                         offset = parse_member_offset(child.attributes.get("DW_AT_data_member_location"), cu)
+                        member_type_id = None
+                        if member_type_die is not None:
+                            target_offset = typedef_alias_target.get(member_type_die.offset, member_type_die.offset)
+                            member_type_id = type_ids.get(target_offset)
                         info.members.append(
                             MemberInfo(
                                 name=member_name,
                                 type_name=member_type_name,
+                                type_id=member_type_id,
                                 offset=offset,
                                 size=member_size,
                             )
@@ -273,8 +356,14 @@ def collect_types(elf_path: Path) -> Tuple[List[TypeInfo], Dict[int, str]]:
                 elif die.tag == "DW_TAG_typedef":
                     base_die = die.get_DIE_from_attribute("DW_AT_type")
                     info.underlying = resolver.resolve_type_name(base_die)
+                    if base_die is not None and base_die.offset in type_ids:
+                        target_offset = typedef_alias_target.get(base_die.offset, base_die.offset)
+                        info.underlying_id = type_ids.get(target_offset)
                 types.append(info)
-    return types, preferred_names
+    hidden_typedef_ids = {
+        type_ids[offset] for offset in typedef_alias_target.keys() if offset in type_ids
+    }
+    return types, preferred_names, hidden_typedef_ids
 
 
 def compute_holes(struct_size: Optional[int], members: Iterable[MemberInfo]) -> List[HoleInfo]:
@@ -372,15 +461,27 @@ def render_external(out_dir: Path, external_types: List[TypeInfo]):
     out_path.write_text(html_page("External types", body))
 
 
-def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path):
-    types = sorted(file_info.types, key=lambda t: (-(t.size or 0), t.display_name))
+def rel_href(base_dir: Path, target: Path) -> str:
+    return os.path.relpath(target, start=base_dir).replace("\\", "/")
+
+
+def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path, hidden_typedef_ids: Set[str]):
+    filtered = [
+        info
+        for info in file_info.types
+        if not (info.kind == "typedef" and info.type_id in hidden_typedef_ids)
+    ]
+    types = sorted(filtered, key=lambda t: (-(t.size or 0), t.display_name))
+    base_dir = Path("file") / rel_path
+    base_dir = base_dir.parent
     rows = []
     for info in types:
         size = "—" if info.size is None else str(info.size)
         hole_count = len([h for h in info.holes if h.kind == "hole"]) if info.kind == "struct" else "—"
+        type_href = rel_href(base_dir, Path("type") / f"{info.type_id}.html")
         rows.append(
             "<tr>"
-            f"<td><a href=\"../type/{info.type_id}.html\">{html.escape(info.display_name)}</a></td>"
+            f"<td><a href=\"{type_href}\">{html.escape(info.display_name)}</a></td>"
             f"<td>{info.kind}</td><td>{size}</td><td>{hole_count}</td>"
             "</tr>"
         )
@@ -389,27 +490,55 @@ def render_file_page(out_dir: Path, file_info: FileInfo, rel_path: Path):
         + "\n".join(rows)
         + "</tbody></table>"
     )
+    out_path = out_dir / "file" / rel_path
+    out_path = out_path.with_suffix(out_path.suffix + ".html")
     body = render_breadcrumbs(
         [
-            ("Index", "../index.html"),
-            ("Source tree", "../dir/index.html"),
-            (str(rel_path), f"../file/{rel_path.as_posix()}.html"),
+            ("Index", rel_href(base_dir, Path("index.html"))),
+            ("Source tree", rel_href(base_dir, Path("dir") / "index.html")),
+            (str(rel_path), rel_href(base_dir, Path("file") / rel_path.with_suffix(rel_path.suffix + ".html"))),
         ]
     )
     body += f"<h1>{html.escape(str(rel_path))}</h1>" + table
-    out_path = out_dir / "file" / rel_path
-    out_path = out_path.with_suffix(out_path.suffix + ".html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_page(f"File {rel_path}", body))
 
 
-def render_type_page(out_dir: Path, info: TypeInfo):
+def build_usage_map(
+    types: List[TypeInfo], hidden_typedef_ids: Set[str]
+) -> Dict[str, List[Tuple[str, str]]]:
+    usage_map: Dict[str, List[Tuple[str, str]]] = {}
+    id_to_info = {info.type_id: info for info in types}
+    visible_typedefs = {
+        info.type_id
+        for info in types
+        if info.kind == "typedef" and info.type_id not in hidden_typedef_ids
+    }
+    for info in types:
+        if info.kind in {"struct", "union"}:
+            for member in info.members:
+                if not member.type_id:
+                    continue
+                usage_map.setdefault(member.type_id, []).append(
+                    (info.type_id, f"{info.display_name}::{member.name}")
+                )
+        if info.kind == "typedef" and info.underlying_id and info.type_id in visible_typedefs:
+            usage_map.setdefault(info.underlying_id, []).append(
+                (info.type_id, f"{info.display_name} (typedef)")
+            )
+    for entries in usage_map.values():
+        entries.sort(key=lambda item: item[1])
+    return usage_map
+
+
+def render_type_page(out_dir: Path, info: TypeInfo, usage_map: Dict[str, List[Tuple[str, str]]]):
     size = "—" if info.size is None else str(info.size)
     decl = "—"
     if info.decl_file:
         decl = html.escape(str(info.decl_file))
         if info.decl_line:
             decl += f":{info.decl_line}"
+    base_dir = Path("type")
     body = render_breadcrumbs([("Index", "../index.html"), ("Type", f"../type/{info.type_id}.html")])
     body += f"<h1>{html.escape(info.display_name)}</h1>"
     body += (
@@ -417,15 +546,23 @@ def render_type_page(out_dir: Path, info: TypeInfo):
         f"Declared at: {decl}</p>"
     )
     if info.kind == "typedef" and info.underlying:
-        body += f"<p>Underlying type: {html.escape(info.underlying)}</p>"
+        if info.underlying_id:
+            underlying_href = rel_href(base_dir, Path("type") / f"{info.underlying_id}.html")
+            body += f"<p>Underlying type: <a href=\"{underlying_href}\">{html.escape(info.underlying)}</a></p>"
+        else:
+            body += f"<p>Underlying type: {html.escape(info.underlying)}</p>"
     if info.members:
         rows = []
         for member in info.members:
             offset = "—" if member.offset is None else str(member.offset)
             msize = "—" if member.size is None else str(member.size)
+            if member.type_id:
+                type_cell = f"<a href=\"{rel_href(base_dir, Path('type') / f'{member.type_id}.html')}\">{html.escape(member.type_name)}</a>"
+            else:
+                type_cell = html.escape(member.type_name)
             rows.append(
                 "<tr>"
-                f"<td>{html.escape(member.name)}</td><td>{html.escape(member.type_name)}</td>"
+                f"<td>{html.escape(member.name)}</td><td>{type_cell}</td>"
                 f"<td>{offset}</td><td>{msize}</td>"
                 "</tr>"
             )
@@ -448,6 +585,18 @@ def render_type_page(out_dir: Path, info: TypeInfo):
             + "\n".join(rows)
             + "</tbody></table>"
         )
+    used_by = usage_map.get(info.type_id, [])
+    if used_by:
+        rows = []
+        for type_id, label in used_by:
+            href = rel_href(base_dir, Path("type") / f"{type_id}.html")
+            rows.append(f"<tr><td><a href=\"{href}\">{html.escape(label)}</a></td></tr>")
+        body += (
+            "<h2>Used by</h2>"
+            "<table><thead><tr><th>Type</th></tr></thead><tbody>"
+            + "\n".join(rows)
+            + "</tbody></table>"
+        )
     out_path = out_dir / "type" / f"{info.type_id}.html"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_page(f"Type {info.display_name}", body))
@@ -456,14 +605,15 @@ def render_type_page(out_dir: Path, info: TypeInfo):
 def build_tree(src_root: Path, files: Dict[Path, FileInfo]) -> Dict[Path, Dict[str, List[Path]]]:
     tree: Dict[Path, Dict[str, List[Path]]] = {}
     for rel_path in files:
-        current = Path(".")
         parts = rel_path.parts
-        for idx, part in enumerate(parts[:-1]):
-            current = current / part
-            tree.setdefault(current, {"dirs": [], "files": []})
-            next_dir = current / parts[idx + 1] if idx + 1 < len(parts) else None
-            if next_dir and next_dir not in tree[current]["dirs"]:
+        current = Path(".")
+        tree.setdefault(current, {"dirs": [], "files": []})
+        for part in parts[:-1]:
+            next_dir = current / part
+            if next_dir not in tree[current]["dirs"]:
                 tree[current]["dirs"].append(next_dir)
+            current = next_dir
+            tree.setdefault(current, {"dirs": [], "files": []})
         tree.setdefault(Path("."), {"dirs": [], "files": []})
         if rel_path.parent == Path("."):
             parent = Path(".")
@@ -475,6 +625,8 @@ def build_tree(src_root: Path, files: Dict[Path, FileInfo]) -> Dict[Path, Dict[s
         for i in range(1, len(parts)):
             dir_path = Path(*parts[:i])
             tree.setdefault(dir_path, {"dirs": [], "files": []})
+    if not tree:
+        tree[Path(".")] = {"dirs": [], "files": []}
     return tree
 
 
@@ -496,31 +648,35 @@ def render_tree_pages(out_dir: Path, src_root: Path, files: Dict[Path, FileInfo]
         dir_sizes[dir_path] = max_size
 
     for dir_path, content in tree.items():
+        base_dir = Path("dir") / dir_path
         items = []
         for child_dir in sorted(content["dirs"], key=lambda p: str(p)):
             size = dir_sizes.get(child_dir)
             size_label = "—" if size is None else str(size)
-            items.append(
-                f"<tr><td><a href=\"../dir/{child_dir.as_posix()}/index.html\">{child_dir.name}/</a></td><td>{size_label}</td></tr>"
-            )
+            href = rel_href(base_dir, Path("dir") / child_dir / "index.html")
+            items.append(f"<tr><td><a href=\"{href}\">{child_dir.name}/</a></td><td>{size_label}</td></tr>")
         for file_rel in sorted(content["files"], key=lambda p: str(p)):
             size = max_struct_size(files[file_rel].types)
             size_label = "—" if size is None else str(size)
-            items.append(
-                f"<tr><td><a href=\"../file/{file_rel.as_posix()}.html\">{file_rel.name}</a></td><td>{size_label}</td></tr>"
-            )
+            file_target = Path("file") / file_rel
+            file_target = file_target.with_suffix(file_target.suffix + ".html")
+            href = rel_href(base_dir, file_target)
+            items.append(f"<tr><td><a href=\"{href}\">{file_rel.name}</a></td><td>{size_label}</td></tr>")
         table = (
             "<table><thead><tr><th>Name</th><th>Max struct size</th></tr></thead><tbody>"
             + "\n".join(items)
             + "</tbody></table>"
         )
-        breadcrumbs = [("Index", "../index.html"), ("Source tree", "../dir/index.html")]
+        breadcrumbs = [
+            ("Index", rel_href(base_dir, Path("index.html"))),
+            ("Source tree", rel_href(base_dir, Path("dir") / "index.html")),
+        ]
         if dir_path != Path("."):
             parts = dir_path.parts
             path_accum = Path(".")
             for part in parts:
                 path_accum = path_accum / part
-                breadcrumbs.append((part, f"../dir/{path_accum.as_posix()}/index.html"))
+                breadcrumbs.append((part, rel_href(base_dir, Path("dir") / path_accum / "index.html")))
         body = render_breadcrumbs(breadcrumbs)
         display_name = "/" if dir_path == Path(".") else dir_path.as_posix()
         body += f"<h1>{html.escape(display_name)}</h1>" + table
@@ -529,37 +685,103 @@ def render_tree_pages(out_dir: Path, src_root: Path, files: Dict[Path, FileInfo]
         out_path.write_text(html_page(f"Dir {display_name}", body))
 
 
-def build_report(elf_path: Path, out_dir: Path, src_root: Optional[Path]):
-    types, _ = collect_types(elf_path)
+def build_report(
+    elf_path: Path,
+    out_dir: Path,
+    src_root: Optional[Path],
+    log_sample: int,
+    log_paths: bool,
+    src_root_aliases: List[Tuple[Path, Path]],
+    use_suffix_match: bool,
+):
+    types, _, hidden_typedef_ids = collect_types(elf_path)
+    logger.info("Collected %d types from %s", len(types), elf_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     files: Dict[Path, FileInfo] = {}
     external_types: List[TypeInfo] = []
     if src_root:
         src_root = src_root.resolve()
+        logger.info("Resolved src-root to %s", src_root)
+    decl_samples: List[Path] = []
     for info in types:
         if info.decl_file and src_root:
+            if log_paths and len(decl_samples) < log_sample:
+                decl_samples.append(info.decl_file)
+            normalized_decl = normalize_decl_path(info.decl_file)
+            if normalized_decl != info.decl_file:
+                logger.debug("Normalized decl path %s -> %s", info.decl_file, normalized_decl)
+            normalized_decl = apply_root_aliases(normalized_decl, src_root_aliases)
+            if use_suffix_match and src_root:
+                suffix_mapped = apply_src_root_suffix(normalized_decl, src_root)
+                if suffix_mapped and suffix_mapped != normalized_decl:
+                    logger.debug(
+                        "Applied src-root suffix match %s -> %s", normalized_decl, suffix_mapped
+                    )
+                    normalized_decl = suffix_mapped
             try:
-                rel = info.decl_file.resolve().relative_to(src_root)
+                rel = normalized_decl.resolve().relative_to(src_root)
             except ValueError:
+                if log_paths and len(external_types) < log_sample:
+                    logger.debug(
+                        "Decl path not under src-root: %s (src-root: %s)",
+                        normalized_decl,
+                        src_root,
+                    )
                 external_types.append(info)
                 continue
-            files.setdefault(rel, FileInfo(path=info.decl_file, types=[])).types.append(info)
+            files.setdefault(rel, FileInfo(path=normalized_decl, types=[])).types.append(info)
         elif src_root:
             external_types.append(info)
         else:
             external_types.append(info)
 
+    logger.info("Mapped %d source files", len(files))
+    logger.info("Classified %d external types", len(external_types))
+    if src_root and not files:
+        logger.warning("No source files mapped under src-root; source tree will be empty.")
+        if log_paths:
+            roots = Counter(
+                decl_root_key(info.decl_file)
+                for info in types
+                if info.decl_file is not None
+            )
+            for root, count in roots.most_common(log_sample):
+                logger.debug("Top decl root: %s (%d types)", root, count)
+            for sample in decl_samples:
+                logger.debug("Decl path sample: %s", sample)
+    if log_paths:
+        for rel, info in files.items():
+            logger.debug("Source file: %s (%d types)", rel, len(info.types))
+        for idx, info in enumerate(external_types[:log_sample]):
+            logger.debug(
+                "External type sample [%d/%d]: %s (%s)",
+                idx + 1,
+                len(external_types),
+                info.display_name,
+                info.decl_file if info.decl_file else "no decl file",
+            )
+
+    usage_map = build_usage_map(types, hidden_typedef_ids)
     for info in types:
-        render_type_page(out_dir, info)
+        if info.kind == "typedef" and info.type_id in hidden_typedef_ids:
+            continue
+        render_type_page(out_dir, info, usage_map)
 
     if src_root:
         for rel_path, info in files.items():
-            render_file_page(out_dir, info, rel_path)
+            render_file_page(out_dir, info, rel_path, hidden_typedef_ids)
         render_tree_pages(out_dir, src_root, files)
+        logger.info("Rendered %d file pages and source tree", len(files))
 
+    external_types = [
+        info
+        for info in external_types
+        if not (info.kind == "typedef" and info.type_id in hidden_typedef_ids)
+    ]
     render_external(out_dir, external_types)
     render_index(out_dir, has_tree=bool(src_root))
+    logger.info("Rendered external index and report index")
 
 
 def parse_args() -> argparse.Namespace:
@@ -567,6 +789,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("elf", type=Path, help="Path to ELF file")
     parser.add_argument("--out", required=True, type=Path, help="Output directory")
     parser.add_argument("--src-root", type=Path, help="Source root directory")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
+    )
+    parser.add_argument("--log-file", type=Path, help="Write logs to this file instead of stderr")
+    parser.add_argument(
+        "--log-sample",
+        type=int,
+        default=5,
+        help="How many external type samples to log (default: 5)",
+    )
+    parser.add_argument(
+        "--log-paths",
+        action="store_true",
+        help="Log mapped source file paths and external type samples",
+    )
+    parser.add_argument(
+        "--src-root-alias",
+        action="append",
+        default=[],
+        metavar="FROM=TO",
+        help="Map source roots when DWARF paths use a different base (repeatable).",
+    )
+    parser.add_argument(
+        "--src-root-suffix",
+        action="store_true",
+        help="Allow suffix-based matching when DWARF paths include extra prefixes.",
+    )
     return parser.parse_args()
 
 
@@ -574,7 +826,26 @@ def main() -> int:
     args = parse_args()
     if not args.elf.exists():
         raise SystemExit(f"ELF not found: {args.elf}")
-    build_report(args.elf, args.out, args.src_root)
+    aliases: List[Tuple[Path, Path]] = []
+    for raw in args.src_root_alias:
+        if "=" not in raw:
+            raise SystemExit(f"Invalid --src-root-alias (expected FROM=TO): {raw}")
+        src_raw, dest_raw = raw.split("=", 1)
+        aliases.append((Path(src_raw), Path(dest_raw)))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        filename=str(args.log_file) if args.log_file else None,
+        format="%(levelname)s %(message)s",
+    )
+    build_report(
+        args.elf,
+        args.out,
+        args.src_root,
+        args.log_sample,
+        args.log_paths,
+        aliases,
+        args.src_root_suffix,
+    )
     return 0
 
 
